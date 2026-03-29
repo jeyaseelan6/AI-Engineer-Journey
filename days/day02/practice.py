@@ -179,6 +179,138 @@ def simulate_embed_chunk(chunk: ProcessedChunk) ->  dict:
 # SECTION C — Retry Decorator
 # ─────────────────────────────────────────
 # ... decorator code here
+import functools
+import time
+from typing import Callable, Type
+
+def retry(
+        attempts: int = 3,
+        delay: float = 1.0,
+        backoff: float = 2.0,
+        exceptions: tuple[Type[Exception], ... ] = (Exception, )
+) -> Callable:
+    """
+    Production grade retry decorator with exponential backoff.
+
+    How it works:
+    → wraps any function
+    → if function raises an exception → wait → retry
+    → each retry waits longer than the last (exponential backoff)
+    → if all attempts exhausted → raise the original error
+
+    Args:
+        attempts   : total number of tries including the first attempt
+        delay      : initial wait time in seconds between retries
+        backoff    : multiplier applied to delay after each failure
+        exceptions : only retry on THESE specific exception types
+                     everything else fails immediately — no retry
+
+    Example:
+        @retry(attempts=3, delay=1.0, backoff=2.0)
+        def call_openai(prompt):
+            return openai.chat(prompt)
+        
+        Attempt 1 fails → wait 1.0s
+        Attempt 2 fails → wait 2.0s
+        Attempt 3 fails → raise error
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            current_delay = delay
+
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = func(*args, **kwargs)
+
+                    #Log recovery if this was not the first attempt
+                    if attempt > 1:
+                        logger.info(
+                            f"'{func.__name__}' recovered successfully "
+                            f"on attempt {attempt}/{attempts}"
+                        )
+                    return result
+                except exceptions as e:
+                    is_last_attempt = attempt == attempts
+
+                    if is_last_attempt:
+                        #All attempts exhausted - give up and raise
+                        logger.error(
+                            f"'{func.__name__}' failed permanently after "
+                            f"{attempts} attempts | "
+                            f"final error: {type(e).__name__}: {e}"
+                        )
+                        raise
+                    # Not last attempt - log and wait
+                    logger.warning(
+                        f"'{func.__name__}' attempt {attempt}/{attempts} "
+                        f"failed | {type(e).__name__}: {e} | "
+                        f"retrying in {current_delay:.1f}s..."
+                    )
+                    time.sleep(current_delay)
+                    current_delay *= backoff #exponential backoff
+        return wrapper
+    return decorator
+
+# ── Simulated AI API calls using the decorator ────────
+
+# Tracks how many times each function has been called
+# In real code this state lives in the API itself
+_call_counts: dict[str ,int] = {}
+
+@retry (attempts=3, delay=0.3, backoff=2.0, exceptions=(ConnectionError,))
+def embed_text(text: str) -> list[float]:
+    """
+    Simulates calling OpenAI embeddings API.
+    Fails first 2 attempts, succeeds on 3rd.
+    Real version: openai.embeddings.create(input=text, model="text-embedding-3-small)
+    """
+    _call_counts["embed_text"] = _call_counts.get("embed_text", 0) + 1
+    count = _call_counts["embed_text"]
+
+    logger.debug(f"embed_text called | attempt count: {count}")
+
+    if count < 3:
+        raise ConnectionError(
+            f"OpenAI API temporarily unavailable ({count})"
+        )
+    
+    #success - return fake embedding vector
+    fake_vector = [float(ord(c)/100) for c in text[:8]]
+    logger.debug(f"Embedding Generated | vector length: {len(fake_vector)}")
+    return fake_vector
+
+@retry(attempts=3, delay=0.3, backoff=2.0, exceptions=(ConnectionError, TimeoutError))
+def generate_rag_response(question:str, context:str) -> str:    
+    """
+    Simulates calling OpenAI chat API with RAG context.
+    Always succeeds — demonstrates the happy path.
+    Real version: openai.chat.completions.create(...)
+    """
+    _call_counts["generate_response"] = _call_counts.get("generate_response",0) + 1
+
+    logger.debug(f"generate_rag_response called | question: '{question[:40]}")
+
+    #simulate API processing time
+    time.sleep(0.1)
+
+    return(
+        f"Based on the provided context, {question[:30]}.... "
+        f"[answer generated from {len(context)} chars of context]"
+    )
+       
+@retry(attempts=2, delay=0.2, backoff=2.0, exceptions=(ConnectionError,))
+def store_in_vector_db(chunk_id: str, vector: list[float]) -> bool:
+    """
+    Simulates storing a vector in ChromaDB or Pinecone.
+    Always fails — demonstrates total failure scenario.
+    Real version: collection.add(embeddings=[vector], ids=[chunk_id])
+    """
+    _call_counts["store_vector"] = _call_counts.get("store_vector", 0) + 1
+
+    logger.debug(f"store_in_vector_db called | chunk_id: {chunk_id}")
+    raise ConnectionError("Vector DB connection refused (simulated total failure)")
 
 
 # ─────────────────────────────────────────
@@ -260,3 +392,40 @@ if __name__ == "__main__":
     logger.info(f"Average words per chunk: {total_words // total_chunks if total_chunks else 0}")
     logger.info(f"Sample chunk stored: {embedded_chunks[0]['chunk_id']}")
     logger.info(f"Sample vector length: {len(embedded_chunks[0]['vector'])}")
+
+# ─────────────────────────────────────────────────
+# SECTION C TESTS — Retry Decorator
+# ─────────────────────────────────────────────────
+logger.info("=" * 55)
+logger.info("SECTION C: Retry decorator with Exponential Backoff")
+logger.info("=" * 55)
+
+
+
+# Test 1 — Partial failure then recovery
+logger.info("\n--- Test 1: Partial failure then recovery ---")
+try:
+    vector = embed_text("What is retrieval augmented generation?")
+    logger.info(f"embed_text succeeded | vector: {vector}")
+except ConnectionError as e:
+    logger.error(f"embed_text failed permanently: {e}")
+
+# Test 2 — Happy path, no failures
+logger.info("\n--- Test 2: Happy path, no failures ---")
+try:
+    context = "RAG combines retrieval with generation to produce grounded answers."
+    response = generate_rag_response(
+        question="What is RAG?",
+        context=context
+    )
+    logger.info(f"Response generated: {response}")
+except Exception as e:
+    logger.error(f"Response generation failed: {e}")
+
+# Test 3 — Total failure, all retries exhausted
+logger.info("\n--- Test 3: Total failure, all retries exhausted ---")
+try:
+    store_in_vector_db("chunk_0001", [0.1, 0.2, 0.3])
+except ConnectionError:
+    logger.error("Vector DB storage failed — chunk will be reprocessed later")
+    # In production: add to a dead letter queue for reprocessing
