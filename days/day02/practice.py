@@ -314,11 +314,288 @@ def store_in_vector_db(chunk_id: str, vector: list[float]) -> bool:
 
 
 # ─────────────────────────────────────────
-# SECTION D — Exception Handling
+# SECTION D — Layered Exception Handling
 # ─────────────────────────────────────────
 # ... exception handling code here
+from typing import Optional
+from pydantic import BaseModel, ValidationError
 
+# ── Step 1: Define Your Own Exception Hierarchy ───────
+#
+# Why custom exceptions?
+# Built-in exceptions like Exception, ValueError are too generic.
+# Custom exceptions let you catch EXACTLY the error you expect
+# and handle it appropriately without catching unrelated errors.
 
+class AIEngineerError(Exception):
+    """
+    Base exception for all errors in our AI system.
+    Every custom exception inherits from this.
+    Lets you catch ALL our custom errors with one except clause.
+    """
+    pass
+
+class AuthenticationError(AIEngineerError):
+    """
+    Invalid or missing API Key.
+    Recovery: Stop immediately. No retry. Fix the key.
+    Never retry authentication errors - retrying won't help.
+    """
+    pass
+
+class RateLimitError(AIEngineerError):
+    """
+    Too Many API requests sent in a short period.
+    Recovery: WAIT then retry with exponential backoff.
+    This is temporary - API will accept requests again soon.                                                                                                                                                                        
+    """
+    pass
+
+class DocumentValidationError(AIEngineerError):
+    """
+    Document or input data failed validation checks.
+    Recovery: REJECT the input, return clear error to user.
+    Do not process invalid data - garbage in, garbage out.
+    """
+    pass
+
+class EmbeddingError(AIEngineerError):
+    """
+    Embedding API call failed after all retries.
+    Recovery: LOG the chunk, skip it, continue pipeline.
+    One bad chunk should not crash the entire pipeline.
+    """
+    pass
+
+class VectorDBError(AIEngineerError):
+    """
+    Vector database operation failed.
+    Recovery: Log and add to retry queue.
+    Data is not lost - it can be reprocessed later.
+    """
+    pass
+
+# ── Step 2: Response Model ────────────────────────────
+
+class PipelineResult(BaseModel):
+    """
+    Structured result from RAG pipeline.
+    Every pipeline run returns this - success or failure.
+    Never return raw strings or unstructured data from pipelines.
+    """
+    success: bool
+    chunks_processed: int = 0
+    chunks_failed: int = 0
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    result: Optional[str] = None
+
+    # ── Step 3: Individual Operation Handlers ────────────
+def validate_document (content: str, min_length:int = 50)-> str:
+    """
+    Validates document before it enters the pipeline.
+    First line of defense - bad data never enters the system.
+
+    Args:
+        content : raw document text from user
+        min_length : minimum acceptable character count
+
+    Returns:
+    cleaned and validated document text
+
+    Raises:
+        DocumentValidationError : if document fails any check
+    """
+
+    # Check 1: document must exist
+    if not content or not content.strip():
+        raise DocumentValidationError(
+            "Document is empty. Please provide text content."
+        )
+    
+    # Check 2: Document must meet minimum length
+    if len(content.strip()) < min_length:
+        raise DocumentValidationError(
+            f"Document too short: {len(content)} chars. "
+            f"Minimum required: {min_length} chars."
+        )
+    
+    #check 3: document must be readable text
+    non_text_ratio = sum(1 for c in content if not c.isprintable()) / len(content)
+    if non_text_ratio > 0.3:
+        raise DocumentValidationError(
+            f"Document appears to be binary or corrupted. "
+            f"Non-printable character ratio: {non_text_ratio:.1%}"
+        )
+    
+    logger.info(f"Document validated | length: {len(content)} chars")
+    return content.strip()
+
+def simulate_api_call(prompt: str, scenario: str = "success") -> dict:
+    """
+    Simulates different API response scenarios.
+    In production this is replaced by real OpenAI API call.
+
+    Args:
+        prompt : input text for the API
+        scenario : which scenario to simulate
+                'success' -> normal response
+                'auth_error' -> invalid API key
+                'rate_limit' -> too many requests
+                'malformed' -> corrupted response
+    
+    Returns:
+            Raw API response dictionary
+
+    Raises: 
+            AuthenticationError : on auth_error scenario
+            RateLimitError : on rate_limit scenario
+    """
+    logger.debug(f"API call | scenario: {scenario} | prompt: '{prompt[:30]}'")
+
+    if scenario == "auth_error":
+        raise AuthenticationError(
+            "API key invalid or expired. "
+            "Check OPENAI_API_KEY in your .env file."
+        )
+    
+    if scenario == "rate_limit":
+        raise RateLimitError(
+            "Rate limit exceeded: 60 requests per minute . "
+            "Current usage: 61 requests. Please wait."
+        )
+    
+    if scenario == "malformed":
+        # Returns response missing expected fields
+        return {"status": "ok"} # missing answer field
+    
+    #success scenario
+    return{
+        "answer": f"RAG combines retrieval with generation to answer: {prompt[:40]}",
+        "tokens_used": 142,
+        "model": "gpt-4"
+    }
+
+def parse_api_response(raw: dict) -> str:
+    """
+    Safely extracts answer from raw API response.
+    Handles malformed response without crashing pipeline.
+
+    Args:
+        raw: raw dictionary response from API
+
+    Returns:
+         Extracted answer string
+
+    Raises:
+        EmbeddingError: if expected fields are missing
+    """
+
+    if 'answer' not in raw:
+        raise EmbeddingError(
+            f"API response missing 'answer' field. "
+            f"Got fields: {list(raw.keys())}"
+        )
+    return raw["answer"] 
+
+# ── Step 4: The Full Pipeline With Layered Handling ──
+
+def run_rag_pipeline(document: str, scenario: str = "success") -> PipelineResult:
+    """
+    Runs the complete RAG pipeline with proper exception handling.
+    Each error type is caught and handled differently.
+    Pipeline never crash silently - every failure is logged and classified.
+
+    Args:
+        document: raw document text from user upload.
+        scenario: API scenario to simulate.
+
+    Returns:
+        PipelineResult with success status and details
+    """
+    logger.info(f"Pipeline Started | scenario : {scenario}")
+    chunks_processed = 0
+    chunks_failed = 0
+
+     # ── Layer 1: Validate input first ─────────────────
+    # Bad data must never enter the pipeline
+    try:
+        validated_doc = validate_document(document)
+    except DocumentValidationError as e:
+        #Reject immediately - clear message to user
+        logger.warning(f"Document rejected: {e}")
+        return PipelineResult(
+            success=False,
+            error_type="DocumentValidationError",
+            error_message=str(e)
+        )
+
+    # ── Layer 2: Call API with specific error handling ─
+    try:
+        raw_response = simulate_api_call(validated_doc, scenario)
+        answer = parse_api_response(raw_response)
+        chunks_processed += 1
+        logger.info(f"API call successful | takens: {raw_response.get('tokens_used')}")
+
+    except AuthenticationError as e:
+        # STOP immediately — retrying will not help
+        # Alert the developer — this needs human intervention
+        logger.critical(f"Authentication failed - pipeline stopped: {e}")
+        return PipelineResult(
+            success=False,
+            error_type="AuthenticationError",
+            error_message=str(e)
+        )
+    
+    except RateLimitError as e:
+        # Recoverable — but retry decorator handles this
+        # Here we just log and report — retry is at decorator level
+        logger.warning(f"Rate limit hit - request queued for retry: {e}")
+        return PipelineResult(
+            success=False,
+            error_type="RateLimitError",
+            error_message=str(e)
+        )
+    
+    except EmbeddingError as e:
+        #Log and skip - one bad chunk should not crash pipeline
+        chunks_failed += 1
+        logger.error(f"Response parsing failed - skipped chunk: {e}")
+        return PipelineResult(
+            success=False,
+            chunk_failed=chunks_failed,
+            error_type="EmbeddingError",
+            error_message=str(e)
+        )
+    
+    except AIEngineerError as e:
+        #catch any other custom error we defined
+        #Safety net for our own exception hierarchy
+        logger.error(f"Pipeline error: {type(e).__name__}: {e}")
+        return PipelineResult(
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e)
+        )
+    
+    except Exception as e:
+        #Catch anything completely unexpected
+        # Last resort - should rarely trigger in well written code
+        logger.critical(f"Unexpected error - investigate immediately:{e}")
+        return PipelineResult(
+            success=False,
+            error_type="UnexpectedError",
+            error_message=str(e)
+        )
+    
+   # ── Layer 3: Return structured success result ──────
+    logger.info(f"Pipeline completed successfully | chunks: {chunks_processed}")
+    return PipelineResult(
+        success=True,
+        chunks_processed=chunks_processed,
+        chunks_failed=chunks_failed,
+        result=answer
+    )
 # ─────────────────────────────────────────
 # MAIN — Run all sections
 # ─────────────────────────────────────────
@@ -429,3 +706,58 @@ try:
 except ConnectionError:
     logger.error("Vector DB storage failed — chunk will be reprocessed later")
     # In production: add to a dead letter queue for reprocessing
+
+    # ─────────────────────────────────────────────────
+    # SECTION D TESTS — Exception Handling
+    # ─────────────────────────────────────────────────
+    logger.info("=" * 55)
+    logger.info("SECTION D: Layered Exception Handling")
+    logger.info("=" * 55)
+
+    # Define all scenarios to test
+    scenarios = [
+        {
+            "name"    : "Valid document, successful API call",
+            "doc"     : "Artificial intelligence is transforming how we build software. RAG pipelines combine retrieval with generation.",
+            "scenario": "success"
+        },
+        {
+            "name"    : "Empty document — validation rejection",
+            "doc"     : "",
+            "scenario": "success"
+        },
+        {
+            "name"    : "Document too short — validation rejection",
+            "doc"     : "Too short",
+            "scenario": "success"
+        },
+        {
+            "name"    : "Valid document — authentication failure",
+            "doc"     : "Artificial intelligence is transforming how we build software systems today.",
+            "scenario": "auth_error"
+        },
+        {
+            "name"    : "Valid document — rate limit hit",
+            "doc"     : "Artificial intelligence is transforming how we build software systems today.",
+            "scenario": "rate_limit"
+        },
+        {
+            "name"    : "Valid document — malformed API response",
+            "doc"     : "Artificial intelligence is transforming how we build software systems today.",
+            "scenario": "malformed"
+        },
+    ]
+
+    # Run every scenario and show structured result
+    for test in scenarios:
+        logger.info(f"\n--- Test: {test['name']} ---")
+        result = run_rag_pipeline(test["doc"], test["scenario"])
+
+        if result.success:
+            logger.info(f"SUCCESS | chunks: {result.chunks_processed}")
+            logger.info(f"Answer: {result.result[:60]}...")
+        else:
+            logger.warning(
+                f"FAILED | type: {result.error_type} | "
+                f"message: {result.error_message}"
+            )
