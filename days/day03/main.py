@@ -208,7 +208,7 @@ def validate_document_endpoint(request: ValidateRequest):
         logger.info("Document validation passed")
 
         return ValidationResponse(
-            isValid=True,
+            is_valid=True,
             message="Document is valid and ready for processing",
             character_count=len(cleaned),
             cleaned_text=cleaned[:200] + "..." if len(cleaned) > 200 else cleaned
@@ -221,5 +221,5 @@ def validate_document_endpoint(request: ValidateRequest):
         return ValidationResponse(
             is_valid=False,
             message=str(e),
-        character_count=len(request.content)
+            character_count=len(request.content)
         )
